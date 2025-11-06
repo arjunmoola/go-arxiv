@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
@@ -6,7 +6,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/arjunmoola/go-arxiv/client"
+	arx "github.com/arjunmoola/go-arxiv/client"
+	"context"
 	"time"
 	"io"
 	"fmt"
@@ -14,11 +15,13 @@ import (
 )
 
 type App struct {
-	arxivClient *client.Client
+	arxivClient *arx.Client
 
 	searchBar textinput.Model
 	searchResults list.Model
 	showResults bool
+
+	errLogs []error
 }
 
 type resultEntry struct {
@@ -30,7 +33,7 @@ type resultEntry struct {
 	pdfLink string
 }
 
-func newResultEntry(entry client.Entry) resultEntry {
+func newResultEntry(entry arx.Entry) list.Item {
 	vp := viewport.New(5, 10)
 	vp.SetContent(entry.Summary)
 
@@ -117,7 +120,7 @@ func newSearchResultList() list.Model {
 func New() *App {
 	input := textinput.New()
 	input.Width = 20
-	client := client.New()
+	client := arx.New()
 
 	searchRes := newSearchResultList()
 
@@ -129,12 +132,62 @@ func New() *App {
 	}
 }
 
+type cmdBatch []tea.Cmd
+
+func (b *cmdBatch) push(cmd ...tea.Cmd) {
+	*b = append(*b, cmd...)
+}
+
+func (b cmdBatch) cmd() tea.Cmd {
+	return tea.Batch(b...)
+}
+
 func (a *App) Init() tea.Cmd {
 	return nil
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	return nil, nil
+	var cmd tea.Cmd
+	var batch cmdBatch
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return a, tea.Quit
+		case "enter":
+			batch.push(searchArxivCmd(a.arxivClient, a.searchBar.Value()))
+		}
+	case arxivSearchResults:
+		a.showResults = true
+
+		if msg.err != nil {
+			a.errLogs = append(a.errLogs, msg.err)
+			break
+		}
+
+		a.searchResults.SetItems(nil)
+
+		entries := msg.feed.Entries
+
+		resultEntries := make([]list.Item, 0, len(entries))
+
+		for _, entry := range entries {
+			resultEntries = append(resultEntries, newResultEntry(entry))
+		}	
+		
+		a.searchResults.SetItems(resultEntries)
+	}
+
+	a.searchBar, cmd =  a.searchBar.Update(msg)
+	batch.push(cmd)
+
+	if a.showResults {
+		a.searchResults, cmd = a.searchResults.Update(msg)
+		batch.push(cmd)
+	}
+
+	return a, batch.cmd()
 }
 
 func (a *App) View() string {
@@ -144,6 +197,37 @@ func (a *App) View() string {
 	builder.WriteRune('\n')
 
 	if a.showResults {
+		builder.WriteString(a.searchResults.View())
 	}
 
+	return builder.String()
 }
+
+func (a *App) Run() error {
+	if _, err := tea.NewProgram(a, tea.WithAltScreen()).Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type arxivSearchResults struct {
+	feed arx.Feed
+	err error
+}
+
+func searchArxivCmd(client *arx.Client, query string) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := client.Search(context.Background(), arx.AllOfTheAbove, query)
+
+		if err != nil {
+			return arxivSearchResults{
+				err: err,
+			}
+		}
+
+		return arxivSearchResults{
+			feed: resp,
+		}
+	}
+}
+
